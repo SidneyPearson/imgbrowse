@@ -1161,6 +1161,8 @@ async function init() {
       }
     }
   }
+  // 空库（.app 首次启动 / 选择的目录没有图片）：自动弹出选文件夹框
+  if (!META.total) openFolderPicker();
 }
 
 // 记住每个相册看到的页
@@ -1439,7 +1441,12 @@ function renderPage() {
   const grid = $('#grid');
   grid.innerHTML = '';
   if (!pager.items.length) {
-    grid.innerHTML = '<div id="empty">这里没有图片</div>';
+    const msg = mode === 'albums'
+      ? '还没有相册 — 点左上角「📁 打开文件夹」选择图片目录'
+      : (mode === 'fav' ? '还没有收藏 — 灯箱里按 . 或点 ★ 收藏图片'
+                        : '这里没有图片');
+    grid.innerHTML = '<div id="empty"></div>';
+    $('#empty').textContent = msg;
     updatePagerUI();
     return;
   }
@@ -2409,22 +2416,52 @@ init();
 
 def main():
     ap = argparse.ArgumentParser(description='本地图片丝滑浏览工具')
-    ap.add_argument('dir', nargs='?', default=os.getcwd(),
+    ap.add_argument('dir', nargs='?', default=None,
                     help='图片根目录（默认当前目录）')
     ap.add_argument('--port', type=int, default=8765)
     ap.add_argument('--no-open', action='store_true', help='不自动打开浏览器')
+    ap.add_argument('--pick', action='store_true',
+                    help='启动时空库待选（前端自动弹出选文件夹框）')
     args = ap.parse_args()
 
     global ROOT, IMAGES, ALBUMS
     load_state()
-    ROOT = os.path.realpath(args.dir)
-    if not os.path.isdir(ROOT):
-        sys.exit('目录不存在: %s' % ROOT)
-    IMAGES, _ = scan(ROOT)
-    if not IMAGES:
-        sys.exit('目录下没有找到图片/视频: %s' % ROOT)
-    sanitize_state()
-    rebuild_albums()
+
+    frozen = getattr(sys, 'frozen', False)   # PyInstaller 打包后的 .app
+    target = args.dir
+    pick_mode = args.pick
+    if target is None and not pick_mode:
+        if frozen:
+            # .app 双击启动（无参数）：先弹系统选文件夹框；取消则进入待选模式
+            picked = pick_folder_native()
+            if picked:
+                target = picked
+            else:
+                pick_mode = True
+        else:
+            target = os.getcwd()
+
+    if pick_mode:
+        # 空库待选：用临时空目录做 ROOT，所有接口正常工作，
+        # 用户在网页里选好文件夹后 /api/set-root 切换
+        ROOT = tempfile.mkdtemp(prefix='imgbrowse-empty-')
+        IMAGES, ALBUMS = [], []
+    else:
+        ROOT = os.path.realpath(target)
+        if not os.path.isdir(ROOT):
+            sys.exit('目录不存在: %s' % ROOT)
+        IMAGES, _ = scan(ROOT)
+        if not IMAGES:
+            if frozen:
+                # .app 拖入/选择的目录里没图：进入待选模式而不是退出
+                pick_mode = True
+                ROOT = tempfile.mkdtemp(prefix='imgbrowse-empty-')
+                IMAGES, ALBUMS = [], []
+            else:
+                sys.exit('目录下没有找到图片/视频: %s' % ROOT)
+        else:
+            sanitize_state()
+            rebuild_albums()
 
     port = args.port
     httpd = None
@@ -2439,8 +2476,11 @@ def main():
 
     url = 'http://127.0.0.1:%d/' % port
     print('imgbrowse 已启动')
-    print('  目录: %s' % ROOT)
-    print('  图片: %d 张（%d 个相册）' % (len(IMAGES), len(ALBUMS)))
+    if pick_mode:
+        print('  （待选模式：请在网页中选择要浏览的文件夹）')
+    else:
+        print('  目录: %s' % ROOT)
+        print('  图片: %d 张（%d 个相册）' % (len(IMAGES), len(ALBUMS)))
     print('  地址: %s' % url)
     print('  缓存: %s' % CACHE_DIR)
     print('  按 Ctrl+C 退出')
