@@ -833,7 +833,13 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
   line-height:1;display:flex;align-items:center;justify-content:center}
 #pager button:hover:not(:disabled){background:var(--panel2);color:var(--text)}
 #pager button:disabled{opacity:.25;cursor:default}
-#pager-info{font-size:12.5px;color:var(--muted);min-width:56px;text-align:center}
+#pager-info{font-size:12.5px;color:var(--muted);min-width:56px;text-align:center;
+  display:flex;align-items:center;gap:5px}
+#pager-goto{width:44px;height:26px;text-align:center;font-size:12.5px;color:var(--text);
+  background:var(--panel);border:1px solid var(--line);border-radius:8px;font-family:inherit;
+  padding:0}
+#pager-goto:focus{outline:none;border-color:var(--accent-dim)}
+#pager-total{min-width:24px;text-align:center}
 /* 多选 */
 .tile-check{position:absolute;top:6px;right:6px;z-index:3;width:22px;height:22px;border-radius:50%;
   background:rgba(0,0,0,.45);border:1.5px solid rgba(255,255,255,.85);color:#fff;
@@ -997,7 +1003,8 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
     <div id="grid"></div>
     <div id="pager">
       <button id="pager-prev" title="上一页 (← / ↑)">‹</button>
-      <span id="pager-info">1 / 1</span>
+      <span id="pager-info"><input id="pager-goto" inputmode="numeric"
+        value="1" title="输入页码后回车跳转"><span class="pager-sep">/</span><span id="pager-total">1</span></span>
       <button id="pager-next" title="下一页 (→ / ↓ / 空格)">›</button>
     </div>
     <div id="sel-bar" hidden>
@@ -1483,7 +1490,9 @@ function updatePagerUI() {
   const total = pager.items.length;
   const pages = Math.max(1, Math.ceil(total / pager.perPage));
   $('#pager').style.display = total > pager.perPage ? '' : 'none';
-  $('#pager-info').textContent = `${pager.page + 1} / ${pages}`;
+  const goto = $('#pager-goto');
+  if (document.activeElement !== goto) goto.value = pager.page + 1;
+  $('#pager-total').textContent = pages;
   $('#pager-prev').disabled = pager.page === 0;
   $('#pager-next').disabled = pager.page >= pages - 1;
 }
@@ -2230,6 +2239,7 @@ function updateDensityBtn() {
 const HELP_ROWS = [
   ['← / → / 空格', '灯箱：上一张 / 下一张'],
   ['↑ / ↓ / PgUp / PgDn', '网格翻页（双指上下滑动亦可）'],
+  ['底部页码框', '输入页码后回车，直接跳到该页'],
   ['Home / End', '跳到第一张 / 最后一张'],
   ['Enter', '打开当前页首图'],
   ['Esc', '关闭灯箱 / 取消选择 / 返回'],
@@ -2268,6 +2278,20 @@ function bindUI() {
   $('#btn-back').onclick = () => showOverview();
   $('#pager-prev').onclick = () => pager.turn(-1);
   $('#pager-next').onclick = () => pager.turn(1);
+  // 页码输入框：输入页码回车跳转
+  const pg = $('#pager-goto');
+  pg.addEventListener('focus', () => pg.select());
+  pg.addEventListener('input', () => { pg.value = pg.value.replace(/\D/g, '').slice(0, 5); });
+  pg.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      const n = parseInt(pg.value, 10);
+      if (!isNaN(n)) pager.goto(n - 1);
+      pg.blur();
+    } else if (e.key === 'Escape') {
+      pg.blur();
+    }
+  });
   // 多选 / 移动 / 提示条
   $('#sel-move').onclick = () => openMovePicker([...selection]);
   $('#sel-clear').onclick = () => clearSelection();
@@ -2350,6 +2374,7 @@ function bindUI() {
         e.preventDefault();
         showOverview();
       } else if ((e.key === 'm' || e.key === 'M') && selection.size) {
+        e.preventDefault();   // 阻止字母落进弹框里刚聚焦的输入框
         openMovePicker([...selection]);
       } else if (e.key === 'Enter' && mode !== 'albums' && view.length) {
         openLightbox(Math.min(pager.page * pager.perPage, view.length - 1));
@@ -2376,7 +2401,9 @@ function bindUI() {
           : document.documentElement.requestFullscreen();
         break;
       case 's': case 'S': toggleSlide(); break;
-      case 'm': case 'M': openMovePicker([curGid]); break;
+      case 'm': case 'M':
+        e.preventDefault();   // 同上，阻止字母落入移动弹框输入框
+        openMovePicker([curGid]); break;
       case 'Backspace': case 'Delete':
         e.preventDefault(); doDelete([curGid]); break;
       case 'i': case 'I': toggleInfo(); break;
