@@ -14,9 +14,12 @@ fi
 
 echo ">> 打包中…"
 rm -rf dist
+ICON=()
+[ -f imgbrowse.icns ] && ICON=(--icon "$PWD/imgbrowse.icns")  # 必须绝对路径：specpath 在 /tmp 下
 "$VENV/bin/pyinstaller" --windowed --name imgbrowse --noconfirm \
   --distpath dist --workpath /tmp/imgbrowse-build-work \
   --specpath /tmp/imgbrowse-build-work \
+  "${ICON[@]}" \
   imgbrowse.py
 rm -rf dist/imgbrowse   # 只保留 .app
 
