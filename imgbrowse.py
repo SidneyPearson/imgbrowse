@@ -1157,7 +1157,7 @@ async function init() {
       if (mem && mem.album !== undefined && IMGS.some(r => r.album === mem.album)) {
         enterAlbum(mem.album, false, mem.page);
       } else {
-        showOverview(false);
+        landDefault(false);
       }
     }
   }
@@ -1241,6 +1241,14 @@ function syncSidebar() {
              : da === album;
     el.classList.toggle('active', on);
   });
+}
+
+// 落地页：有子文件夹相册 → 封面墙；全是散图 → 直接进图片网格
+function landDefault(rewrite = true) {
+  const hasSub = META.albums.some(a => a.name !== '');
+  const hasRoot = META.albums.some(a => a.name === '');
+  if (!hasSub && hasRoot) enterAlbum('', rewrite);
+  else showOverview(rewrite);
 }
 
 // 封面墙（默认首页）
@@ -1650,7 +1658,7 @@ async function applyRoot(path) {
     if (!lb.hidden) closeLightbox();
     closeFolderPicker();
     buildSidebar();
-    showOverview(false);
+    landDefault(false);
     showToast(`已加载：${d.root}（${d.albums.length} 个相册 / ${d.total} 张）`, false);
   } catch (e) {
     showToast('打开失败：' + e, false);
