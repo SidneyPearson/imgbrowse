@@ -4,16 +4,19 @@
 # 零依赖（仅标准库），缩略图通过 macOS 自带 sips 生成并缓存。
 
 import argparse
+import datetime
 import hashlib
 import json
 import mimetypes
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -90,6 +93,265 @@ _gen_locks_guard = threading.Lock()
 _sips_sem = threading.Semaphore(3)
 
 
+# ---------------------------------------------------------------- 元数据
+# 纯标准库提取拍摄时间与"是否相机原图"：不依赖 Spotlight/TCC 权限，毫秒级。
+# JPEG 读 APP1/EXIF；HEIC 读 ISO-BMFF 容器内的 Exif 项；视频读 moov/mvhd 创建时间。
+
+def _iter_boxes(buf, start=0, end=None):
+    """遍历 ISO-BMFF 盒子（ftyp/meta/moov…），yield (类型, 内容偏移, 内容长度)。"""
+    end = len(buf) if end is None else end
+    o = start
+    while o + 8 <= end:
+        size = int.from_bytes(buf[o:o + 4], 'big')
+        typ = buf[o + 4:o + 8]
+        if size < 8 or o + size > end:
+            break
+        yield typ, o + 8, size - 8
+        o += size
+
+
+def _parse_exif_tiff(tiff):
+    """解析 TIFF 头，返回 (拍摄时间 epoch 或 None, 是否含相机型号)。"""
+    if len(tiff) < 8 or tiff[:2] not in (b'II', b'MM'):
+        return None, False
+    bo = '<' if tiff[:2] == b'II' else '>'
+
+    def u16(o):
+        return struct.unpack(bo + 'H', tiff[o:o + 2])[0]
+
+    def u32(o):
+        return struct.unpack(bo + 'I', tiff[o:o + 4])[0]
+
+    def to_epoch(s):
+        try:
+            dt = datetime.datetime.strptime(s, '%Y:%m:%d %H:%M:%S')
+            return time.mktime(dt.timetuple())      # EXIF 无时区，按本地时间
+        except (ValueError, OverflowError):
+            return None
+
+    date = None
+    camera = False
+
+    def walk(off, depth):
+        nonlocal date, camera
+        if depth > 3 or off <= 0 or off + 2 > len(tiff):
+            return
+        n = u16(off)
+        for i in range(n):
+            e = off + 2 + i * 12
+            if e + 12 > len(tiff):
+                break
+            tag, typ, cnt = u16(e), u16(e + 2), u32(e + 4)
+            unit = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}.get(typ, 1)
+            total = unit * cnt
+            vo = e + 8 if total <= 4 else u32(e + 8)
+            if vo < 0 or vo + max(total, 1) > len(tiff):
+                continue
+            if tag in (0x010F, 0x0110):             # Make / Model
+                if tiff[vo:vo + total].strip(b'\x00 '):
+                    camera = True
+            elif tag in (0x9003, 0x9004):           # DateTimeOriginal / Digitized
+                s = tiff[vo:vo + 20].split(b'\x00')[0].decode('ascii', 'ignore')
+                date = date or to_epoch(s)
+            elif tag == 0x0132 and date is None:    # DateTime（兜底）
+                s = tiff[vo:vo + 20].split(b'\x00')[0].decode('ascii', 'ignore')
+                date = to_epoch(s)
+            elif tag == 0x8769:                     # Exif IFD 指针
+                walk(u32(e + 8), depth + 1)
+
+    walk(u32(4), 0)
+    return date, camera
+
+
+def _jpeg_meta(fp):
+    """JPEG：找 APP1(Exif) 段。"""
+    with open(fp, 'rb') as f:
+        if f.read(2) != b'\xff\xd8':
+            return None, False
+        while True:
+            h = f.read(2)
+            if len(h) < 2 or h[0] != 0xFF:
+                return None, False
+            m = h[1]
+            if m in (0xD9, 0xDA):                   # EOI / SOS：到头了
+                return None, False
+            size_b = f.read(2)
+            if len(size_b) < 2:
+                return None, False
+            size = int.from_bytes(size_b, 'big')
+            if size < 2:
+                return None, False
+            if m == 0xE1:                           # APP1
+                payload = f.read(size - 2)
+                if payload[:4] == b'Exif':
+                    return _parse_exif_tiff(payload[6:])
+                return None, False
+            f.seek(size - 2, 1)
+
+
+def _heic_meta(fp):
+    """HEIC/HEIF：meta 盒子里 iinf 找 Exif 项、iloc 定位数据，再解析 TIFF。"""
+    with open(fp, 'rb') as f:
+        f.seek(0, 2)
+        fend = f.tell()
+        f.seek(0)
+        meta = None
+        while f.tell() + 8 <= fend:
+            h = f.read(8)
+            size = int.from_bytes(h[:4], 'big')
+            typ = h[4:8]
+            body = 8
+            if size == 1:                           # 64 位宽盒
+                size = int.from_bytes(f.read(8), 'big')
+                body = 16
+            if size < body:
+                break
+            if typ == b'meta':
+                meta = f.read(size - body)
+                break
+            f.seek(size - body, 1)
+        if meta is None or len(meta) < 8:
+            return None, False
+
+        exif_id = None
+        locs = {}
+        for typ, o, ln in _iter_boxes(meta, 4):     # meta 头 4 字节版本/标志
+            if typ == b'iinf':
+                exif_id = _heic_exif_id(meta[o:o + ln])
+            elif typ == b'iloc':
+                locs = _heic_iloc(meta[o:o + ln])
+        if exif_id is None or exif_id not in locs:
+            return None, False
+        off, length = locs[exif_id]
+        f.seek(off)
+        raw = f.read(min(length or 256 * 1024, 512 * 1024))
+        # Exif 项数据 = 4 字节大端偏移 + TIFF 头（II*\0 或 MM\0*）
+        cands = [i for i in (raw.find(b'II*\x00'), raw.find(b'MM\x00*'))
+                 if i >= 0]
+        if not cands:
+            return None, False
+        return _parse_exif_tiff(raw[min(cands):])
+
+
+def _heic_exif_id(buf):
+    """从 iinf 的 infe 项里找 item_type == 'Exif' 的 item id。"""
+    if len(buf) < 8:
+        return None
+    ver = buf[0]
+    start = 6 if ver == 0 else 8
+    for typ, o, ln in _iter_boxes(buf, start, len(buf)):
+        if typ != b'infe' or ln < 12:
+            continue
+        b = buf[o:o + ln]
+        if b[0] >= 2 and b[8:12] == b'Exif':        # v2+: item_type 在偏移 8
+            return int.from_bytes(b[4:6], 'big')
+        # v0/v1：偏移 4 起是以 \0 结尾的名称字符串
+        name = b[4:].split(b'\x00')[0]
+        if name == b'Exif':
+            return int.from_bytes(b[2:4], 'big') if len(b) >= 4 else None
+    return None
+
+
+def _heic_iloc(buf):
+    """解析 iloc，返回 {item_id: (绝对偏移, 长度)}。
+    实测 Apple 设备的 iloc v1：条目固定头为 8 字节——item_ID(u16) +
+    data_ref_index(u16) 后还有 2 字节保留字段，再才是 extent_count(u16)。"""
+    if len(buf) < 8:
+        return {}
+    ver = buf[0]
+    off_sz, len_sz = buf[4] >> 4, buf[4] & 0xF
+    base_sz = buf[5] >> 4
+    idx_sz = (buf[5] & 0xF) if ver >= 1 else 0
+    cnt_w = 4 if ver >= 2 else 2
+    id_w = 4 if ver >= 2 else 2
+    p = 6
+    if p + cnt_w > len(buf):
+        return {}
+    cnt = int.from_bytes(buf[p:p + cnt_w], 'big')
+    p += cnt_w
+    extra_hdr = 2 if ver == 1 else 0   # v1 实测的保留 u16（规范文档未载）
+
+    def rd(o, n):
+        return int.from_bytes(buf[o:o + n], 'big') if n else 0
+
+    out = {}
+    for _ in range(cnt):
+        if p + id_w + 2 + base_sz + extra_hdr + 2 > len(buf):
+            break
+        item_id = rd(p, id_w)
+        p += id_w + 2                          # item_ID + data_ref_index
+        base = rd(p, base_sz)
+        p += base_sz + extra_hdr
+        ext_cnt = rd(p, 2)
+        p += 2
+        for _e in range(ext_cnt):
+            if idx_sz:
+                p += idx_sz                     # extent_index / 构造方式
+            if p + off_sz + len_sz > len(buf):
+                break
+            eoff = rd(p, off_sz)
+            elen = rd(p + off_sz, len_sz)
+            p += off_sz + len_sz
+            out[item_id] = (base + eoff, elen)  # 取第一个 extent
+            break
+    return out
+
+
+def _video_capture_date(fp):
+    """MOV/MP4：moov/mvhd 的 creation_time（Mac 纪元 1904 起）。"""
+    with open(fp, 'rb') as f:
+        f.seek(0, 2)
+        fend = f.tell()
+        f.seek(0)
+        mvhd = None
+        while f.tell() + 8 <= fend and mvhd is None:
+            h = f.read(8)
+            size = int.from_bytes(h[:4], 'big')
+            typ = h[4:8]
+            body = 8
+            if size == 1:
+                size = int.from_bytes(f.read(8), 'big')
+                body = 16
+            if size < body:
+                break
+            if typ == b'moov':
+                moov = f.read(size - body)
+                for t, o, ln in _iter_boxes(moov, 0):
+                    if t == b'mvhd':
+                        mvhd = moov[o:o + ln]
+                        break
+                break
+            f.seek(size - body, 1)
+        if not mvhd or len(mvhd) < 8:
+            return None
+        ct = int.from_bytes(mvhd[4:12], 'big') if mvhd[0] == 1 \
+            else int.from_bytes(mvhd[4:8], 'big')
+        if ct == 0:
+            return None
+        epoch = ct - 2082844800                  # 1904-01-01 → 1970-01-01
+        return epoch if epoch > 0 else None
+
+
+def media_meta(fp, ext, st, typ):
+    """返回 (拍摄时间 epoch, 来源 'camera'/'other')。失败回退文件创建时间。"""
+    ts, cam = None, False
+    try:
+        if typ == 'video':
+            ts = _video_capture_date(fp)
+        elif ext in ('.heic', '.heif'):
+            ts, cam = _heic_meta(fp)
+        elif ext in ('.jpg', '.jpeg'):
+            ts, cam = _jpeg_meta(fp)
+    except Exception:
+        pass
+    # HEIC/视频必为相机拍摄；JPEG 有 EXIF（型号/拍摄时间）视为相机原图，
+    # 无 EXIF 的 JPG/PNG/截图/微信保存图归为 other。
+    is_cam = typ == 'video' or ext in ('.heic', '.heif') or bool(cam) or \
+        (typ == 'image' and ext in ('.jpg', '.jpeg') and ts is not None)
+    birth = getattr(st, 'st_birthtime', None) or st.st_mtime
+    return int(ts or birth), ('camera' if is_cam else 'other')
+
+
 # ---------------------------------------------------------------- 扫描
 
 def scan(root):
@@ -107,9 +369,11 @@ def scan(root):
             typ = 'video'
         else:
             return
+        ts, src = media_meta(fp, ext, st, typ)
         images.append({'album': album, 'name': os.path.basename(relname),
                        'rel': relname, 'size': st.st_size,
-                       'type': typ, 'k': cache_key(fp, st)})
+                       'type': typ, 'k': cache_key(fp, st),
+                       'ts': ts, 'src': src})
 
     # macOS 包（Bundle/Package）扩展名：这些"文件夹"是资源包，
     # 递归进去会把内部缩略图/缓存当照片（如 Photos Library.photoslibrary）
@@ -407,6 +671,13 @@ def image_info(img_id):
                     pass
     except Exception:
         pass
+    # Spotlight 没有拍摄时间时，用扫描阶段解析的 EXIF/容器时间兜底
+    if not info.get('date') and rec.get('ts'):
+        try:
+            info['date'] = datetime.datetime.fromtimestamp(
+                rec['ts']).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            pass
     return info
 
 
@@ -954,6 +1225,36 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
 #btn-help{padding:5px 10px}
 #btn-open:hover,#btn-density:hover,#btn-help:hover{background:var(--panel2);color:var(--text);border-color:var(--accent-dim)}
 
+/* ---------- 筛选 / 排序工具条 ---------- */
+#filterbar{flex:none;display:none;align-items:center;gap:8px;padding:6px 14px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.seg{display:inline-flex;background:var(--bg);border:1px solid var(--line);
+  border-radius:999px;padding:2px;flex:none}
+.seg button{padding:4px 12px;border-radius:999px;color:var(--muted);font-size:12.5px;
+  white-space:nowrap;display:flex;align-items:center;gap:5px}
+.seg button:hover:not(:disabled){color:var(--text)}
+.seg button.on{background:var(--accent-dim);color:#fff}
+.seg button:disabled{opacity:.4;cursor:default}
+.seg-n{font-size:11px;opacity:.75}
+.seg button.on .seg-n{opacity:.9}
+#btn-camera{padding:5px 12px;border-radius:999px;border:1px solid var(--line);
+  color:var(--muted);font-size:12.5px;flex:none}
+#btn-camera:hover:not(:disabled){color:var(--text);border-color:var(--accent-dim)}
+#btn-camera.on{background:var(--accent-dim);color:#fff;border-color:var(--accent-dim)}
+#btn-camera:disabled{opacity:.4;cursor:default}
+.fb-label{color:var(--muted);font-size:12px;flex:none}
+/* 视频折叠分组瓦片 */
+.tile.video-group{background:linear-gradient(135deg,#262c3d,#1a1d27)}
+.video-group img{opacity:.4}
+.video-group:hover img{transform:scale(1.06);opacity:.55}
+.vg-overlay{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;
+  gap:8px;align-items:center;justify-content:center;color:#fff;text-align:center;padding:8px}
+.vg-play{width:48px;height:48px;border-radius:50%;background:rgba(0,0,0,.55);
+  border:1.5px solid rgba(255,255,255,.85);display:flex;align-items:center;justify-content:center;
+  font-size:17px;padding-left:3px;transition:background .15s}
+.video-group:hover .vg-play{background:var(--accent-dim)}
+.vg-text{font-size:12.5px;font-weight:600;text-shadow:0 1px 4px #000;line-height:1.4}
+
 /* ---------- 灯箱 ---------- */
 #lightbox{position:fixed;inset:0;z-index:50;background:rgba(8,9,12,.97);
   display:flex;align-items:center;justify-content:center;
@@ -1019,6 +1320,21 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
       <button id="btn-density" title="切换网格密度">▦ 标准</button>
       <button id="btn-help" title="快捷键帮助 (?)">？</button>
     </header>
+    <div id="filterbar">
+      <div class="seg" id="seg-type">
+        <button type="button" data-t="all">全部</button>
+        <button type="button" data-t="photo">🖼 图片</button>
+        <button type="button" data-t="video">▶ 视频</button>
+      </div>
+      <button id="btn-camera" type="button"
+        title="只看相机拍摄的照片：隐藏微信保存图、截图等非相机内容（视频不受影响）">📷 仅相机拍摄</button>
+      <span style="flex:1"></span>
+      <span class="fb-label">排序</span>
+      <div class="seg" id="seg-sort">
+        <button type="button" data-s="name">文件名</button>
+        <button type="button" data-s="time">拍摄时间</button>
+      </div>
+    </div>
     <div id="grid"></div>
     <div id="pager">
       <button id="pager-prev" title="上一页 (← / ↑)">‹</button>
@@ -1130,6 +1446,13 @@ const pref = {
   get(k, d) { try { const v = localStorage.getItem('imgbrowse:' + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
   set(k, v) { try { localStorage.setItem('imgbrowse:' + k, JSON.stringify(v)); } catch (_) {} },
 };
+
+// 视图筛选 / 排序（持久化）
+let typeFilter = pref.get('typeFilter', 'all');   // 'all' | 'photo' | 'video'
+let cameraOnly = pref.get('cameraOnly', false);   // 仅相机拍摄（隐藏微信图/截图）
+let sortBy = pref.get('sortBy', 'name');          // 'name' | 'time'
+let collapsed = [];               // “全部”模式下被折叠的视频 id
+const VIDEO_GROUP = {__vg: true}; // 网格里的视频分组占位项
 
 const fmtSize = n => n >= 1048576 ? (n/1048576).toFixed(1)+' MB'
                    : Math.max(1, Math.round(n/1024)) + ' KB';
@@ -1277,17 +1600,80 @@ function landDefault(rewrite = true) {
   else showOverview(rewrite);
 }
 
+// 按当前 模式/筛选/排序 计算 view（灯箱遍历序列）与分页 items。
+// “全部”模式下视频折叠为一个分组瓦片（VIDEO_GROUP），不进灯箱序列。
+function buildView() {
+  if (mode === 'albums') {
+    $('#filterbar').style.display = 'none';
+    pager.items = META.albums.slice();
+    return;
+  }
+  $('#filterbar').style.display = 'flex';
+  const base = mode === 'fav'
+    ? [...favSet].map(g => IMGS[g]).filter(Boolean)
+    : IMGS.filter(r => r.album === album);
+  const vids = base.filter(r => r.type === 'video');
+  const pics = base.filter(r => r.type !== 'video');
+  const shownPics = cameraOnly ? pics.filter(r => r.src === 'camera') : pics;
+  const cmp = sortBy === 'time'
+    ? (a, b) => (a.ts || 0) - (b.ts || 0) || a.name.localeCompare(b.name, 'zh')
+    : (a, b) => a.name.localeCompare(b.name, 'zh')
+             || (a.ts || 0) - (b.ts || 0);
+  vids.sort(cmp);
+  shownPics.sort(cmp);
+  view = (typeFilter === 'video' ? vids : shownPics).map(r => r.id);
+  collapsed = typeFilter === 'all' ? vids.map(r => r.id) : [];
+  pager.items = view.concat(collapsed.length ? [VIDEO_GROUP] : []);
+
+  // 工具条计数与高亮
+  const labels = {all: '全部', photo: '🖼 图片', video: '▶ 视频'};
+  $('#seg-type').querySelectorAll('button').forEach(b => {
+    const t = b.dataset.t;
+    const n = t === 'all' ? base.length : (t === 'photo' ? pics.length : vids.length);
+    b.innerHTML = `${labels[t]}<span class="seg-n">${n}</span>`;
+    b.classList.toggle('on', t === typeFilter);
+  });
+  $('#seg-sort').querySelectorAll('button').forEach(b =>
+    b.classList.toggle('on', b.dataset.s === sortBy));
+  const camBtn = $('#btn-camera');
+  camBtn.classList.toggle('on', cameraOnly);
+  camBtn.disabled = typeFilter === 'video';   // 视频都是相机拍摄
+  $('#cur-count').textContent =
+    `照片 ${pics.length} · 视频 ${vids.length}` +
+    (cameraOnly && typeFilter !== 'video' ? ` · 相机拍摄 ${shownPics.length}` : '');
+}
+
+function setTypeFilter(t) {
+  if (typeFilter === t) return;
+  typeFilter = t;
+  pref.set('typeFilter', t);
+  buildView();
+  pager.goto(0);
+}
+function toggleCameraOnly() {
+  cameraOnly = !cameraOnly;
+  pref.set('cameraOnly', cameraOnly);
+  buildView();
+  pager.goto(0);
+}
+function setSortBy(s) {
+  if (sortBy === s) return;
+  sortBy = s;
+  pref.set('sortBy', s);
+  buildView();
+  pager.goto(pager.page);    // 排序保持当前页
+}
+
 // 封面墙（默认首页）
 function showOverview(rewrite = true) {
   mode = 'albums';
-  const grid = $('#grid');
-  grid.classList.add('albums');
+  $('#grid').classList.add('albums');
   $('#btn-back').style.display = 'none';
   $('#cur-name').textContent = '相册总览';
   $('#cur-count').textContent =
     `${META.albums.length} 个相册 · 共 ${IMGS.length} 张图片`;
   syncSidebar();
-  pager.items = META.albums.slice();
+  buildView();
   pager.goto(0);
   if (rewrite) history.replaceState(null, '', '#');
 }
@@ -1295,15 +1681,11 @@ function showOverview(rewrite = true) {
 // 收藏视图
 function showFavorites(rewrite = true) {
   mode = 'fav';
-  view = [...favSet].sort((a, b) =>
-    (IMGS[a].album + IMGS[a].name).localeCompare(IMGS[b].album + IMGS[b].name, 'zh'));
-  const grid = $('#grid');
-  grid.classList.remove('albums');
+  $('#grid').classList.remove('albums');
   $('#btn-back').style.display = '';
   $('#cur-name').textContent = '⭐ 我的收藏';
-  $('#cur-count').textContent = `共 ${view.length} 张`;
   syncSidebar();
-  pager.items = view.slice();
+  buildView();
   pager.goto(0);
   if (rewrite) history.replaceState(null, '', '#fav');
 }
@@ -1312,16 +1694,11 @@ function showFavorites(rewrite = true) {
 function enterAlbum(name, rewrite = true, page = 0) {
   mode = 'photos';
   album = name;
-  const grid = $('#grid');
-  grid.classList.remove('albums');
+  $('#grid').classList.remove('albums');
   $('#btn-back').style.display = '';
-  view = IMGS.filter(r => r.album === album)
-             .sort((a, b) => a.name.localeCompare(b.name, 'zh'))
-             .map(r => r.id);
   $('#cur-name').textContent = album === '' ? '（根目录）' : album;
-  $('#cur-count').textContent = `共 ${view.length} 张`;
   syncSidebar();
-  pager.items = view.slice();
+  buildView();
   pager.goto(page);
   if (rewrite) history.replaceState(null, '', albumHash(album));
   rememberLocation();
@@ -1344,7 +1721,7 @@ const pager = {
 
 const selection = new Set();   // 选中的全局图片 id
 
-function makePhotoTile(gid, idx) {
+function makePhotoTile(gid) {
   const it = IMGS[gid];
   const tile = document.createElement('div');
   tile.className = 'tile' + (selection.has(gid) ? ' sel' : '');
@@ -1380,14 +1757,15 @@ function makePhotoTile(gid, idx) {
       const a = pager.items.indexOf(anchorGid), b = pager.items.indexOf(gid);
       if (a >= 0 && b >= 0) {
         const [lo, hi] = a < b ? [a, b] : [b, a];
-        pager.items.slice(lo, hi + 1).forEach(g => selection.add(g));
+        pager.items.slice(lo, hi + 1)
+          .forEach(g => { if (typeof g === 'number') selection.add(g); });
         refreshSelUI();
         return;
       }
     }
     anchorGid = gid;
     if (selection.size) { toggleSelect(gid); return; }  // 选择模式下点击=勾选
-    openLightbox(idx);
+    openAt(gid);
   };
   tile.addEventListener('contextmenu', e => {
     e.preventDefault();
@@ -1471,33 +1849,66 @@ function calcPageSize() {
   pager.perPage = pager.cols * rows;
 }
 
+function emptyMessage() {
+  if (mode === 'albums')
+    return '还没有相册 — 点左上角「📁 打开文件夹」选择图片目录';
+  if (mode === 'fav' && !favSet.size)
+    return '还没有收藏 — 灯箱里按 . 或点 ★ 收藏图片';
+  if (typeFilter === 'video')
+    return '这里没有视频';
+  if (cameraOnly)
+    return '当前筛选下没有相机拍摄的照片 — 试试关闭「📷 仅相机拍摄」';
+  if (mode === 'fav')
+    return '当前筛选条件下没有收藏的内容';
+  return '这里没有图片';
+}
+
+function makeVideoGroupTile() {
+  const tile = document.createElement('div');
+  tile.className = 'tile video-group';
+  const first = collapsed[0];
+  if (first != null) {
+    const im = document.createElement('img');
+    im.alt = '';
+    im.draggable = false;
+    im.dataset.src = imgUrl(first, 'grid');
+    im.onload = () => im.classList.add('loaded');
+    tile.appendChild(im);
+    if (io) io.observe(im); else im.src = im.dataset.src;
+  }
+  const ov = document.createElement('span');
+  ov.className = 'vg-overlay';
+  ov.innerHTML = '<span class="vg-play">▶</span><span class="vg-text"></span>';
+  ov.querySelector('.vg-text').textContent =
+    `${collapsed.length} 个视频 · 点击展开`;
+  tile.appendChild(ov);
+  tile.title = `展开 ${collapsed.length} 个视频`;
+  tile.onclick = () => setTypeFilter('video');
+  return tile;
+}
+
 function renderPage() {
   const grid = $('#grid');
   grid.innerHTML = '';
   if (!pager.items.length) {
-    const msg = mode === 'albums'
-      ? '还没有相册 — 点左上角「📁 打开文件夹」选择图片目录'
-      : (mode === 'fav' ? '还没有收藏 — 灯箱里按 . 或点 ★ 收藏图片'
-                        : '这里没有图片');
     grid.innerHTML = '<div id="empty"></div>';
-    $('#empty').textContent = msg;
+    $('#empty').textContent = emptyMessage();
     updatePagerUI();
     return;
   }
   grid.style.gridTemplateColumns = `repeat(${pager.cols},1fr)`;
   const start = pager.page * pager.perPage;
   const frag = document.createDocumentFragment();
-  let i = 0;
   for (const item of pager.items.slice(start, start + pager.perPage)) {
-    frag.appendChild(mode === 'albums'
-      ? makeAlbumCard(item)
-      : makePhotoTile(item, start + i));
-    i++;
+    if (item === VIDEO_GROUP) frag.appendChild(makeVideoGroupTile());
+    else frag.appendChild(mode === 'albums' ? makeAlbumCard(item)
+                                           : makePhotoTile(item));
   }
   grid.appendChild(frag);
-  // 预加载下一页缩略图，翻页时零等待
+  // 预加载下一页缩略图，翻页时零等待（跳过视频分组占位项）
   pager.items.slice(start + pager.perPage, start + 2 * pager.perPage)
     .forEach(item => {
+      if (item === VIDEO_GROUP) return;
       const gid = mode === 'albums' ? item.cover : item;
       const tier = mode === 'albums' ? 'cover' : 'grid';
       new Image().src = imgUrl(gid, tier);
@@ -1634,9 +2045,8 @@ async function doMove(ids, dest) {
     showToast(`已移动 ${data.moved.length} 张到「${dest}」`, true);
     // 相册内灯箱连续归档：当前图移走后，原位显示下一张；收藏视图跨相册不移除
     if (!lb.hidden && mode === 'photos') {
-      view = view.filter(g => IMGS[g].album === source);
       if (!view.length) closeLightbox();
-      else { pos = Math.min(pos, view.length - 1); navDir = 0; show(); }
+      else { pos = Math.min(pos, view.length - 1); navDir = 0; buildStrip(); show(); }
     }
   } catch (e) {
     showToast('移动失败：' + e, false);
@@ -1915,7 +2325,28 @@ function nav(d) {
   show();
 }
 
+// 目标被当前筛选隐藏时（如视频在“全部”里被折叠、微信图被“仅相机”隐藏），
+// 自动放宽筛选再打开（从 URL #id 进入时也走这里）
+function ensureVisible(gid) {
+  const it = IMGS[gid];
+  if (!it) return false;
+  let changed = false;
+  if (it.type === 'video' && typeFilter !== 'video') {
+    typeFilter = 'video'; changed = true;
+  } else if (it.type !== 'video' && it.src === 'other' && cameraOnly) {
+    cameraOnly = false; changed = true;
+  }
+  if (changed) {
+    pref.set('typeFilter', typeFilter);
+    pref.set('cameraOnly', cameraOnly);
+    buildView();
+    pager.goto(0);
+  }
+  return view.includes(gid);
+}
+
 function openAt(gid) {
+  if (!view.includes(gid) && !ensureVisible(gid)) return;
   const idx = view.indexOf(gid);
   if (idx >= 0) openLightbox(idx);
 }
@@ -2090,13 +2521,13 @@ async function setFav(gid, on) {
     updateFavCount();
     // 收藏视图里取消收藏 → 从视图移除
     if (mode === 'fav' && !on) {
-      view = view.filter(g => g !== gid);
-      pager.items = view.slice();
+      buildView();
       if (!lb.hidden) {
         const idx = view.indexOf(curGid);
         if (idx < 0) { closeLightbox(); pager.goto(pager.page); return; }
         pos = idx;
         navDir = 0;
+        buildStrip();
         show();
       }
       pager.goto(pager.page);
@@ -2147,22 +2578,10 @@ async function doDelete(ids) {
   }
 }
 
-// 按当前模式重建视图（删除/移动后调用）
+// 按当前模式/筛选重建视图（删除/移动/重命名后调用）
 function refreshView() {
   buildSidebar();
-  if (mode === 'albums') {
-    pager.items = META.albums.slice();
-  } else if (mode === 'fav') {
-    view = [...favSet].filter(g => IMGS[g]).sort((a, b) =>
-      (IMGS[a].album + IMGS[a].name).localeCompare(
-        IMGS[b].album + IMGS[b].name, 'zh'));
-    pager.items = view.slice();
-  } else {
-    view = IMGS.filter(r => r.album === album)
-               .sort((a, b) => a.name.localeCompare(b.name, 'zh'))
-               .map(r => r.id);
-    pager.items = view.slice();
-  }
+  buildView();
   pager.goto(pager.page);
 }
 
@@ -2372,6 +2791,15 @@ function bindUI() {
     }
   });
   $('#btn-density').onclick = cycleDensity;
+  $('#seg-type').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (b && b.dataset.t) setTypeFilter(b.dataset.t);
+  });
+  $('#seg-sort').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (b && b.dataset.s) setSortBy(b.dataset.s);
+  });
+  $('#btn-camera').onclick = toggleCameraOnly;
   $('#btn-help').onclick = showHelp;
   document.querySelectorAll('#help-picker .mp-back').forEach(el =>
     el.onclick = () => closeHelp());
