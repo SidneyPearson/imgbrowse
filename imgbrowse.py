@@ -111,14 +111,28 @@ def scan(root):
                        'rel': relname, 'size': st.st_size,
                        'type': typ, 'k': cache_key(fp, st)})
 
+    # macOS 包（Bundle/Package）扩展名：这些"文件夹"是资源包，
+    # 递归进去会把内部缩略图/缓存当照片（如 Photos Library.photoslibrary）
+    PKG_EXT = ('.photoslibrary', '.app', '.framework', '.bundle', '.plugin',
+               '.kext', '.xpc', '.workflow', '.photolibrary')
+
+    def scan_dir(base, album):
+        for dp, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs
+                             if not d.startswith('.') and
+                             not os.path.splitext(d)[1].lower() in PKG_EXT)
+            for f in sorted(files):
+                add(os.path.join(dp, f), album,
+                    os.path.relpath(os.path.join(dp, f), root))
+
     for name in sorted(os.listdir(root)):
         p = os.path.join(root, name)
+        if name.startswith('.'):
+            continue
         if os.path.isdir(p):
-            for dp, dirs, files in os.walk(p):
-                dirs.sort()
-                for f in sorted(files):
-                    fp = os.path.join(dp, f)
-                    add(fp, name, os.path.relpath(fp, root))
+            if os.path.splitext(name)[1].lower() in PKG_EXT:
+                continue
+            scan_dir(p, name)
         elif os.path.isfile(p):
             add(p, '', name)
     # 根目录散图在前，其余按 相册/相对路径 排序
