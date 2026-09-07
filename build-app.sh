@@ -28,5 +28,7 @@ ditto -c -k --keepParent dist/imgbrowse.app dist/imgbrowse-macos-arm64.zip
 
 echo ">> 完成："
 ls -lh dist/imgbrowse-macos-arm64.zip
-echo "   发布：gh release create v1.0.0 dist/imgbrowse-macos-arm64.zip \\"
-echo "     --title 'imgbrowse v1.0.0' --notes '见 README 安装说明'"
+echo "   发布（版本号自行递增，只保留最新一个 Release）："
+echo "   gh release create vX.Y.Z dist/imgbrowse-macos-arm64.zip \\"
+echo "     --title 'imgbrowse vX.Y.Z' --notes '改动说明'"
+echo "   删除旧版：gh release delete <旧tag> --yes --cleanup-tag"
