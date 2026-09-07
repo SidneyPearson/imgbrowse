@@ -971,6 +971,11 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
   white-space:nowrap}
 #lb-bar button:hover{background:var(--panel2);color:var(--text)}
 #lb-bar button.on{color:#fff;background:var(--accent-dim)}
+/* 鼠标静止时自动隐藏灯箱界面元素，干净看图 */
+#lb-bar,#lb-strip,.lb-arrow,#lb-caption{transition:opacity .3s ease}
+#lightbox.idle #lb-bar,#lightbox.idle #lb-strip,
+#lightbox.idle .lb-arrow,#lightbox.idle #lb-caption{opacity:0;pointer-events:none}
+#lightbox.idle #lb-stage{cursor:none}
 #lb-tip{position:absolute;bottom:20px;right:20px;font-size:11px;color:rgba(255,255,255,.4)}
 @media (max-width:720px){
   #sidebar{position:absolute;z-index:20;height:100%}
@@ -1732,6 +1737,26 @@ const lb = $('#lightbox'), stage = $('#lb-stage'),
       lbImg = $('#lb-img'), lbThumb = $('#lb-thumb'),
       lbVideo = $('#lb-video'), lbStrip = $('#lb-strip');
 
+// 鼠标静止 2.2s 自动隐藏工具栏/胶片条/箭头/标题，干净看图；一动即恢复
+let idleTimer = null;
+function scheduleIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    // 鼠标正停在工具栏/胶片条上，或信息面板开着时，保持显示
+    if ($('#lb-bar:hover') || $('#lb-strip:hover') || !$('#lb-info').hidden) {
+      scheduleIdle();
+      return;
+    }
+    lb.classList.add('idle');
+  }, 2200);
+}
+function pokeChrome() {
+  if (lb.hidden) return;
+  lb.classList.remove('idle');
+  scheduleIdle();
+}
+lb.addEventListener('mousemove', pokeChrome);
+
 function openLightbox(idx) {
   pos = idx;
   navDir = 0;
@@ -1739,10 +1764,13 @@ function openLightbox(idx) {
   document.body.style.overflow = 'hidden';
   buildStrip();
   show();
+  pokeChrome();
 }
 function closeLightbox() {
   lb.hidden = true;
   document.body.style.overflow = '';
+  clearTimeout(idleTimer);
+  lb.classList.remove('idle');
   stopSlide();
   pauseVideo();
   $('#lb-info').hidden = true;
@@ -1965,8 +1993,9 @@ lbImg.addEventListener('dblclick', e => { e.stopPropagation(); toggleActual(); }
 stage.addEventListener('dblclick', e => {
   if (lbVideo.hidden && (e.target === stage || e.target === lbThumb)) toggleActual();
 });
-// 单击背景关闭（拖拽过的不算）
+// 单击背景关闭（拖拽过的不算）；界面处于自动隐藏状态时，先唤醒界面不关闭
 stage.addEventListener('click', e => {
+  if (lb.classList.contains('idle')) { pokeChrome(); return; }
   if (!moved && (e.target === stage || e.target === lbThumb)) closeLightbox();
 });
 
@@ -2389,6 +2418,7 @@ function bindUI() {
       }
       return;
     }
+    pokeChrome();   // 灯箱内任何按键都唤醒界面
     switch (e.key) {
       case 'ArrowLeft': case 'PageUp': e.preventDefault(); nav(-1); break;
       case 'ArrowRight': case 'PageDown': case ' ':
